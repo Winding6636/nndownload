@@ -1,6 +1,5 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Download videos and process other links from Niconico (nicovideo.jp)."""
+
 import argparse
 import asyncio
 import collections
@@ -12,8 +11,10 @@ import math
 import mimetypes
 import netrc
 import os
+import random
 import re
 import shutil
+import string
 import sys
 import tempfile
 import threading
@@ -28,11 +29,13 @@ from bs4 import BeautifulSoup
 from mutagen.mp4 import MP4, MP4StreamInfoError
 from requests.adapters import HTTPAdapter
 from requests.utils import add_dict_to_cookiejar
+from rich.progress import Progress
 from urllib3.util import Retry
 
-from .ffmpeg_dl import FfmpegDL, FfmpegDLException
+from .ffmpeg_dl import FfmpegDL, FfmpegDLException, FfmpegExistsException
+from .hls_dl import download_hls
 
-__version__ = "1.16.3"
+__version__ = "1.18"
 __author__ = "Alex Aplin"
 __copyright__ = "Copyright 2024 Alex Aplin"
 __license__ = "MIT"
@@ -44,8 +47,8 @@ MY_URL = "https://www.nicovideo.jp/my"
 # LOGIN_URL = "https://account.nicovideo.jp/api/v1/login?site=niconico"
 LOGIN_URL = "https://account.nicovideo.jp/login/redirector?show_button_twitter=1&site=niconico&show_button_facebook=1&sec=header_pc&next_url=/"
 VIDEO_URL = "https://nicovideo.jp/watch/{0}"
+USER_URL = "https://nicovideo.jp/user/{0}"
 NAMA_URL = "https://live.nicovideo.jp/watch/{0}"
-SERIES_URL = "https://www.nicovideo.jp/series/{0}"
 CHANNEL_VIDEOS_URL = "https://ch.nicovideo.jp/{0}/video?page={1}"
 CHANNEL_LIVES_URL = "https://ch.nicovideo.jp/{0}/live?page={1}"
 CHANNEL_BLOMAGA_URL = "https://ch.nicovideo.jp/{0}/blomaga?page={1}"
@@ -53,7 +56,9 @@ CHANNEL_ARTICLE_URL = "https://ch.nicovideo.jp/article/{0}"
 SEIGA_USER_ILLUST_URL = "https://seiga.nicovideo.jp/user/illust/{0}?page={1}"
 SEIGA_USER_MANGA_URL = "https://seiga.nicovideo.jp/manga/list?user_id={0}&page={1}"  # Not all manga are not listed with /user/manga/{0}
 SEIGA_IMAGE_URL = "https://seiga.nicovideo.jp/seiga/{0}"
+SEIGA_IMAGE_THUMBNAIL_URL = "https://lohas.nicoseiga.jp//thumb/{0}qz" # "cz" can be specified for a consistent 176x176 thumb
 SEIGA_MANGA_URL = "https://seiga.nicovideo.jp/comic/{0}"
+SEIGA_MANGA_THUMBNAIL_URL = "https://deliver.cdn.nicomanga.jp/thumb/mg_thumb/{0}q" # Not sure where this ID originates, so instead we pull "og:image"
 SEIGA_CHAPTER_URL = "https://seiga.nicovideo.jp/watch/{0}"
 SEIGA_SOURCE_URL = "https://seiga.nicovideo.jp/image/source/{0}"
 SEIGA_CDN_URL = "https://lohas.nicoseiga.jp/"
@@ -61,32 +66,38 @@ TIMESHIFT_USE_URL = "https://live.nicovideo.jp/api/timeshift.ticket.use"
 TIMESHIFT_RESERVE_URL = "https://live.nicovideo.jp/api/timeshift.reservations"
 
 CONTENT_TYPE = r"(watch|mylist|user\/illust|user\/manga|user|comic|seiga|gate|article|channel|manga|illust|series)"
-VALID_URL_RE = re.compile(r"https?://(?:(?:(?:(ch|sp|www|seiga)\.)|(?:(live[0-9]?|cas)\.))?"
+USER_CONTENT_TYPE = r"(video|mylist|live|blomaga|list|series|follow)"
+VALID_URL_RE = re.compile(r"https?://(?:(?:(?:(ch|sp|www|seiga|manga)\.)|(?:(live[0-9]?|cas)\.))?"
                           rf"(?:(?:nicovideo\.jp/{CONTENT_TYPE}?)(?(3)/|))|(nico\.ms)/)"
-                          r"((?:(?:[a-z]{2})?\d+)|[a-zA-Z0-9-]+?)/?(?:/(video|mylist|live|blomaga|list))?"
+                          rf"((?:(?:[a-z]{2})?\d+)|[a-zA-Z0-9-]+?)/?(?:/{USER_CONTENT_TYPE})?"
                           r"(?(6)/((?:[a-z]{2})?\d+))?(?:\?(?:user_id=(.*)|.*)?)?$")
 M3U8_STREAM_RE = re.compile(r"(?:(?:#EXT-X-STREAM-INF)|#EXT-X-I-FRAME-STREAM-INF):.*(?:BANDWIDTH=(\d+)).*\n(.*)")
 M3U8_MEDIA_RE = re.compile(r"(?:#EXT-X-MEDIA:TYPE=)(?:(\w+))(?:.*),URI=\"(.*)\"")
-M3U8_KEY_RE = re.compile(r"((?:#EXT-X-KEY)(?:.*),?URI=\")(.*)\"(.*)")
-M3U8_MAP_RE = re.compile(r"((?:#EXT-X-MAP)(?:.*),?URI=\")(.*)\"(.*)")
 SEIGA_DRM_KEY_RE = re.compile(r"/image/([a-z0-9]+)")
 SEIGA_USER_ID_RE = re.compile(r"user_id=(\d+)")
 SEIGA_MANGA_ID_RE = re.compile(r"/comic/(\d+)")
 
 THUMB_INFO_API = "http://ext.nicovideo.jp/api/getthumbinfo/{0}"
 MYLIST_API = "https://nvapi.nicovideo.jp/v2/mylists/{0}?pageSize=500"  # 500 video limit for premium mylists
+MYLIST_ME_API = "https://nvapi.nicovideo.jp/v1/users/me/mylists/{0}?pageSize=500" # Still on /v1
+SERIES_API = "https://nvapi.nicovideo.jp/v2/series/{0}?&pageSize=500"  # Same as mylists
 VIDEO_DMS_WATCH_API = "https://nvapi.nicovideo.jp/v1/watch/{0}/access-rights/hls?actionTrackId={1}"
-USER_VIDEOS_API = "https://nvapi.nicovideo.jp/v1/users/{0}/videos?sortKey=registeredAt&sortOrder=desc&pageSize={1}&page={2}"
+USER_VIDEOS_API = "https://nvapi.nicovideo.jp/v3/users/{0}/videos?sortKey=registeredAt&sortOrder=desc&pageSize={1}&page={2}"
 USER_MYLISTS_API = "https://nvapi.nicovideo.jp/v1/users/{0}/mylists"
+USER_SERIES_API = "https://nvapi.nicovideo.jp/v1/users/{0}/series"
+USER_FOLLOWING_API = "https://nvapi.nicovideo.jp/v1/users/{0}/following/users?pageSize=800" # 800 following limit for premium users
 SEIGA_MANGA_TAGS_API = "https://seiga.nicovideo.jp/ajax/manga/tag/list?id={0}"
-COMMENTS_API = "https://nv-comment.nicovideo.jp/v1/threads"
+COMMENTS_API = "https://public.nvcomment.nicovideo.jp/v1/threads"
 COMMENTS_API_POST_DATA = "{{\'params\':{0},\'threadKey\':\'{1}\',\'additionals\':{{}}}}"
+USER_HISTORY_API = "https://nvapi.nicovideo.jp/v1/users/me/watch/history?page={0}&pageSize={1}"
+USER_LIKES_API = "nvapi.nicovideo.jp/v1/users/me/watch/likes?page={0}&pageSize={1}"
+USER_WATCHLATER_API = "https://nvapi.nicovideo.jp/v1/users/me/watch-later?sortKey=addedAt&sortOrder=desc&pageSize={0}&page={1}"
 
 REGION_LOCK_ERRORS = {  "お住まいの地域・国からは視聴することができません。",
                         "この動画は投稿( アップロード )された地域と同じ地域からのみ視聴できます。"
                      }
 
-USER_VIDEOS_API_N = 25
+USER_VIDEOS_API_N = 100
 NAMA_HEARTBEAT_INTERVAL_S = 30
 NAMA_PLAYLIST_INTERVAL_S = 5
 DMC_HEARTBEAT_INTERVAL_S = 15
@@ -96,6 +107,7 @@ BLOCK_SIZE = 1024
 EPSILON = 0.0001
 RETRY_ATTEMPTS = 5
 BACKOFF_FACTOR = 2  # retry_timeout_s = BACKOFF_FACTOR * (2 ** ({RETRY_ATTEMPTS} - 1))
+TEMP_PATH_LEN = 16
 
 MIMETYPES = {
     "image/gif": "gif",
@@ -122,7 +134,7 @@ TW_COOKIE = {
 API_HEADERS = {
     "X-Frontend-Id": "6",
     "X-Frontend-Version": "0",
-    "X-Niconico-Language": "ja-jp"
+    "X-Niconico-Language": "ja-jp"  # Does not impact parameter extraction
 }
 
 NAMA_ORIGIN_HEADER = {"Origin": "https://live2.nicovideo.jp"}
@@ -164,9 +176,9 @@ PONG_FRAME = json.loads("""{"type":"pong"}""")
 
 logger = logging.getLogger(__name__)
 
-cmdl_usage = "%(prog)s [options] input"
-cmdl_version = __version__
-cmdl_parser = argparse.ArgumentParser(usage=cmdl_usage, conflict_handler="resolve")
+CMDL_USAGE = "%(prog)s [options] input"
+CMDL_VERSION = __version__
+cmdl_parser = argparse.ArgumentParser(usage=CMDL_USAGE, conflict_handler="resolve")
 
 cmdl_parser.add_argument("-u", "--username", dest="username", metavar="EMAIL/TEL",
                          help="account email address or telephone number")
@@ -174,8 +186,8 @@ cmdl_parser.add_argument("-p", "--password", dest="password", metavar="PASSWORD"
 cmdl_parser.add_argument("--session-cookie", dest="session_cookie", metavar="COOKIE", help="user_session cookie value (string or filepath)")
 cmdl_parser.add_argument("-n", "--netrc", action="store_true", dest="netrc", help="use .netrc authentication")
 cmdl_parser.add_argument("-q", "--quiet", action="store_true", dest="quiet", help="suppress output to console")
-cmdl_parser.add_argument("-l", "--log", action="store_true", dest="log", help="log output to file")
-cmdl_parser.add_argument("-v", "--version", action="version", version=cmdl_version)
+cmdl_parser.add_argument("-l", "--log", nargs="?", const=f"[{MODULE_NAME}] {time.strftime('%Y-%m-%d')}.log", dest="log", metavar="PATH", help="log output to file")
+cmdl_parser.add_argument("-v", "--version", action="version", version=CMDL_VERSION)
 cmdl_parser.add_argument("input", action="store", nargs="*", help="URLs or files")
 
 dl_group = cmdl_parser.add_argument_group("download options")
@@ -209,44 +221,32 @@ dl_group.add_argument("--break-on-existing", action="store_true", dest="break_on
 dl_group.add_argument("--playlist-start", dest="playlist_start", metavar="N", type=int, default=0,
                       help="specify the index to start a list of items from (begins at 0)")
 
-
 # Globals
 
-_start_time = _progress = 0
-_cmdl_opts = None
+_START_TIME = _PROGRESS = 0
+_CMDL_OPTS = None
 
 
 class AuthenticationException(Exception):
     """Raised when logging in to Niconico failed."""
-    pass
-
 
 class ArgumentException(Exception):
     """Raised when reading the argument failed."""
-    pass
-
 
 class FormatNotSupportedException(Exception):
     """Raised when the response format is not supported."""
-    pass
-
 
 class FormatNotAvailableException(Exception):
     """Raised when the requested format is not available."""
-    pass
-
 
 class ParameterExtractionException(Exception):
     """Raised when parameters could not be successfully extracted."""
-    pass
 
 class ExistingDownloadEncounteredQuit(Exception):
     """Raised when an existing and complete download is encountered."""
-    pass
 
 class ListQualitiesQuit(Exception):
     """Raised when listing available qualities for a video."""
-    pass
 
 
 ## Utility methods
@@ -254,9 +254,9 @@ class ListQualitiesQuit(Exception):
 def configure_logger():
     """Initialize logger."""
 
-    if _cmdl_opts.log:
+    if _CMDL_OPTS.log:
         logger.setLevel(logging.INFO)
-        log_handler = logging.FileHandler(f"[{MODULE_NAME}] {time.strftime('%Y-%m-%d')}.log", encoding="utf-8")
+        log_handler = logging.FileHandler(_CMDL_OPTS.log, encoding="utf-8")
         formatter = logging.Formatter("%(asctime)s %(levelname)s: %(message)s")
         log_handler.setFormatter(formatter)
         logger.addHandler(log_handler)
@@ -265,23 +265,23 @@ def configure_logger():
 def log_exception(error: Exception):
     """Process exception for logger."""
 
-    if _cmdl_opts.log:
+    if _CMDL_OPTS.log:
         sys.stdout.write("{0}: {1}\n".format(type(error).__name__, str(error)))
         sys.stdout.flush()
-        logger.exception("An exception was encountered:\n".format(type(error).__name__, str(error)))
+        logger.exception("An exception was encountered:\n")
     else:
         output("{0}: {1}\n".format(type(error).__name__, str(error)), logging.ERROR, force=True)
 
 
-def output(string: AnyStr, level=logging.INFO, force: bool = False):
+def output(out_str: AnyStr, level=logging.INFO, force: bool = False):
     """Print status to console unless quiet flag is set."""
 
-    global _cmdl_opts
-    if _cmdl_opts.log:
-        logger.log(level, string.strip("\n"))
+    global _CMDL_OPTS
+    if _CMDL_OPTS.log:
+        logger.log(level, out_str.strip("\n"))
 
-    if not _cmdl_opts.quiet or force:
-        sys.stdout.write(string)
+    if not _CMDL_OPTS.quiet or force:
+        sys.stdout.write(out_str)
         sys.stdout.flush()
 
 
@@ -301,8 +301,8 @@ def format_value(value: int, custom_type: str = "B", use_bits: bool = False):
         converted = float(value / base ** exponent)
         return "{0:.2f}{1}{2}".format(converted, suffix, custom_type) if not use_bits else "{0}{1}{2}".format(converted, suffix, custom_type)
 
-    except IndexError:
-        raise IndexError("Could not format number of bytes")
+    except IndexError as exception:
+        raise IndexError("Could not format number of bytes") from exception
 
 
 def calculate_speed(start, now, prog_bytes):
@@ -330,7 +330,7 @@ def sanitize_for_path(value: AnyStr, replace: AnyStr = ' '):
 def create_filename(template_params: dict, is_comic: bool = False):
     """Create filename from document parameters."""
 
-    filename_template = _cmdl_opts.output_path
+    filename_template = _CMDL_OPTS.output_path
 
     if filename_template:
         template_dict = dict(template_params)
@@ -431,7 +431,7 @@ def generic_dl_request(session: requests.Session, uri: AnyStr, filename: AnyStr,
 def rewrite_file(filename: AnyStr, old_str: AnyStr, new_str: AnyStr):
     """Replace a string in a text file."""
 
-    with open(filename, "r+") as file:
+    with open(filename, "r+", encoding="utf-8") as file:
         raw = file.read()
         new = raw.replace(old_str, new_str)
         file.seek(0)
@@ -557,7 +557,6 @@ async def open_nama_websocket(
 
             finally:
                 heartbeat.cancel()
-                return
 
 
 def reserve_timeshift(session: requests.Session, nama_id: AnyStr) -> AnyStr:
@@ -653,23 +652,24 @@ def determine_seiga_file_type(dec_bytes):
 def collect_seiga_image_parameters(session: requests.Session, document: BeautifulSoup, template_params: dict) -> dict:
     """Extract template parameters from a Seiga image page."""
 
-    template_params["id"] = document.select("#clip_group_list")[0]["data-target_id"]
-    template_params["title"] = document.select("h1.title")[0].text
-    template_params["description"] = document.select("p.discription")[0].text
-    template_params["published"] = document.select("span.created")[0].text
-    template_params["uploader"] = document.select("li.user_name strong")[0].text
-    template_params["uploader_id"] = int(document.select("li.user_link a")[0]["href"].replace("/user/illust/", ""))
-    template_params["view_count"] = int(document.select("li.view span.count_value")[0].text)
-    template_params["comment_count"] = int(document.select("li.comment span.count_value")[0].text)
-    template_params["clip_count"] = int(document.select("li.clip span.count_value")[0].text)
-    template_params["tags"] = document.select("meta[name=\"keywords\"]")[0]["content"]
+    template_params["id"] = document.select_one("#clip_group_list")["data-target_id"]
+    template_params["title"] = document.select_one("h1.title").text
+    template_params["description"] = document.select_one("p.discription").text
+    template_params["published"] = document.select_one("span.created").text
+    template_params["uploader"] = document.select_one("li.user_name strong").text
+    template_params["uploader_id"] = int(document.select_one("li.user_link a")["href"].replace("/user/illust/", ""))
+    template_params["view_count"] = int(document.select_one("li.view span.count_value").text)
+    template_params["comment_count"] = int(document.select_one("li.comment span.count_value").text)
+    template_params["clip_count"] = int(document.select_one("li.clip span.count_value").text)
+    template_params["tags"] = document.select_one("meta[name=\"keywords\"]")["content"]
     template_params["document_url"] = SEIGA_IMAGE_URL.format(template_params["id"])
+    template_params["thumbnail_url"] = SEIGA_IMAGE_THUMBNAIL_URL.format(template_params["id"])
 
     seiga_source_request = session.get(SEIGA_SOURCE_URL.format(template_params["id"].lstrip("im")))
     seiga_source_request.raise_for_status()
     seiga_source_document = BeautifulSoup(seiga_source_request.text, "html.parser")
 
-    source_url_relative = seiga_source_document.select("div.illust_view_big")[0]["data-src"]
+    source_url_relative = seiga_source_document.select_one("div.illust_view_big")["data-src"]
     template_params["url"] = source_url_relative
 
     source_image_request = session.get(template_params["url"])
@@ -683,18 +683,19 @@ def collect_seiga_image_parameters(session: requests.Session, document: Beautifu
 def collect_seiga_manga_parameters(session, document, template_params):
     """Extract template parameters from a Seiga manga chapter page."""
 
-    bare_chapter_id = document.select("#full_watch_head_bar")[0]["data-theme-id"]
-    template_params["manga_id"] = int(document.select("#full_watch_head_bar")[0]["data-content-id"])
-    template_params["manga_title"] = document.select("div.manga_title a")[0].text
+    bare_chapter_id = document.select_one("#full_watch_head_bar")["data-theme-id"]
+    template_params["manga_id"] = int(document.select_one("#full_watch_head_bar")["data-content-id"])
+    template_params["manga_title"] = document.select_one("div.manga_title a").text
     template_params["id"] = "mg" + bare_chapter_id
-    template_params["page_count"] = int(document.select("#full_watch_head_bar")[0]["data-page-count"])
-    template_params["title"] = document.select("span.episode_title")[0].text
-    template_params["published"] = document.select("span.created")[0].text
-    template_params["description"] = document.select("div.description .full")[0].text
-    template_params["comment_count"] = int(document.select("#comment_count")[0].text)
-    template_params["view_count"] = int(document.select("#view_count")[0].text)
-    template_params["uploader"] = document.select("span.author_name")[0].text
+    template_params["page_count"] = int(document.select_one("#full_watch_head_bar")["data-page-count"])
+    template_params["title"] = document.select_one("span.episode_title").text
+    template_params["published"] = document.select_one("span.created").text
+    template_params["description"] = document.select_one("div.description .full").text
+    template_params["comment_count"] = int(document.select_one("#comment_count").text)
+    template_params["view_count"] = int(document.select_one("#view_count").text)
+    template_params["uploader"] = document.select_one("span.author_name").text
     template_params["document_url"] = SEIGA_CHAPTER_URL.format(template_params["id"])
+    template_params["thumbnail_url"] = document.select_one("meta[property='og:image']")["content"]
 
     tags = []
     tags_request = session.get(SEIGA_MANGA_TAGS_API.format(bare_chapter_id))
@@ -706,8 +707,8 @@ def collect_seiga_manga_parameters(session, document, template_params):
     template_params["tags"] = tags
 
     # No uploader ID for official manga uploads
-    if document.select("dd.user_name a"):
-        template_params["uploader_id"] = int(SEIGA_USER_ID_RE.search(document.select("dd.user_name a")[0]["href"]).group(1))
+    if document.select_one("dd.user_name a"):
+        template_params["uploader_id"] = int(SEIGA_USER_ID_RE.search(document.select_one("dd.user_name a")["href"]).group(1))
 
     return template_params
 
@@ -724,7 +725,7 @@ def download_manga_chapter(session, chapter_id):
     template_params = collect_seiga_manga_parameters(session, chapter_document, template_params)
     chapter_directory = create_filename(template_params, is_comic=True)
 
-    if not _cmdl_opts.skip_media:
+    if not _CMDL_OPTS.skip_media:
         output("Downloading {0} to \"{1}\"...\n".format(chapter_id, chapter_directory), logging.INFO)
 
         images = chapter_document.select("img.lazyload")
@@ -754,12 +755,13 @@ def download_manga_chapter(session, chapter_id):
         output("\n", logging.DEBUG)
         output("Finished downloading {0} to \"{1}\".\n".format(chapter_id, chapter_directory), logging.INFO)
 
-    if _cmdl_opts.dump_metadata:
+    if _CMDL_OPTS.dump_metadata:
         metadata_path = os.path.join(chapter_directory, "metadata.json")
         dump_metadata(metadata_path, template_params)
-    if _cmdl_opts.download_thumbnail:
-        output("Downloading thumbnails for Seiga comics is not currently supported.\n", logging.WARNING)
-    if _cmdl_opts.download_comments:
+    if _CMDL_OPTS.download_thumbnail:
+        thumb_filename = os.path.join(chapter_directory, "folder")
+        download_thumbnail(session, thumb_filename, template_params)
+    if _CMDL_OPTS.download_comments:
         output("Downloading comments for Seiga comics is not currently supported.\n", logging.WARNING)
 
 
@@ -791,7 +793,7 @@ def download_image(session, image_id):
 
     filename = create_filename(template_params)
 
-    if not _cmdl_opts.skip_media:
+    if not _CMDL_OPTS.skip_media:
         output("Downloading {0} to \"{1}\"...\n".format(image_id, filename), logging.INFO)
 
         source_image_request = session.get(template_params["url"], stream=True)
@@ -803,11 +805,11 @@ def download_image(session, image_id):
 
         output("Finished donwloading {0} to \"{1}\".\n".format(image_id, filename), logging.INFO)
 
-    if _cmdl_opts.dump_metadata:
+    if _CMDL_OPTS.dump_metadata:
         dump_metadata(filename, template_params)
-    if _cmdl_opts.download_thumbnail:
-        output("Downloading thumbnails for Seiga images is not currently supported.\n", logging.WARNING)
-    if _cmdl_opts.download_comments:
+    if _CMDL_OPTS.download_thumbnail:
+        download_thumbnail(session, filename, template_params, set_thumb_extension=True)
+    if _CMDL_OPTS.download_comments:
         output("Downloading comments for Seiga images is not currently supported.\n", logging.WARNING)
 
 
@@ -840,8 +842,8 @@ def request_seiga_user(session, user_id):
     if total_ids == 0:
         raise ParameterExtractionException("Failed to collect user images. Please verify that the user's images page is public")
 
-    if _cmdl_opts.playlist_start:
-        start_index = _cmdl_opts.playlist_start
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
         if start_index >= len(illust_ids):
             raise ArgumentException("Starting index exceeds length of the user's available images")
         else:
@@ -888,8 +890,8 @@ def request_seiga_user_manga(session, user_id):
     if total_ids == 0:
         raise ParameterExtractionException("Failed to collect user images. Please verify that the user's manga page is public")
 
-    if _cmdl_opts.playlist_start:
-        start_index = _cmdl_opts.playlist_start
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
         if start_index >= len(manga_ids):
             raise ArgumentException("Starting index exceeds length of the user's available manga")
         else:
@@ -941,7 +943,7 @@ def download_channel_article(session: requests.Session, article_id: AnyStr):
 
     filename = create_filename(template_params)
 
-    if not _cmdl_opts.skip_media:
+    if not _CMDL_OPTS.skip_media:
         output("Downloading {0} to \"{1}\"...\n".format(article_id, filename), logging.INFO)
 
         with open(filename, "w", encoding="utf-8") as article_file:
@@ -950,9 +952,9 @@ def download_channel_article(session: requests.Session, article_id: AnyStr):
                 "</h2>", "\n").replace("<h3>", "\n### ").replace("</h3>", "\n").replace("<ul>", "").replace( "</ul>", "").replace(
                 "<li>", "- ").replace("</li>", "\n").strip()
             article_file.write(pretty_article_text)
-    if _cmdl_opts.dump_metadata:
+    if _CMDL_OPTS.dump_metadata:
         dump_metadata(filename, template_params)
-    if _cmdl_opts.download_comments:
+    if _CMDL_OPTS.download_comments:
         output("Downloading article comments is not currently supported.\n", logging.WARNING)
 
     output("Finished downloading {0} to \"{1}\".\n".format(article_id, filename), logging.INFO)
@@ -986,8 +988,8 @@ def request_channel(session: requests.Session, channel_slug: AnyStr):
         raise ParameterExtractionException("Failed to collect channel videos. Please verify that the channel's videos page is public")
     output("{} videos returned.\n".format(total_ids), logging.INFO)
 
-    if _cmdl_opts.playlist_start:
-        start_index = _cmdl_opts.playlist_start
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
         if start_index >= len(video_ids):
             raise ArgumentException("Starting index exceeds length of the channel's video playlist")
         else:
@@ -1049,12 +1051,12 @@ def request_video(session: requests.Session, video_id: AnyStr):
             raise FormatNotAvailableException("Could not retrieve video info from thumbnail API")
 
     concat_cookies = {}
-    if _cmdl_opts.download_english:
+    if _CMDL_OPTS.download_english:
         concat_cookies = {**concat_cookies, **EN_COOKIE}
-    elif _cmdl_opts.download_chinese:
+    elif _CMDL_OPTS.download_chinese:
         concat_cookies = {**concat_cookies, **TW_COOKIE}
 
-    if _cmdl_opts.download_english and _cmdl_opts.download_chinese:
+    if _CMDL_OPTS.download_english and _CMDL_OPTS.download_chinese:
         output("Multiple language flags were specified. --english will be used as the fallback.\n", logging.INFO)
 
     video_request = session.get(VIDEO_URL.format(video_id), cookies=concat_cookies)
@@ -1065,24 +1067,28 @@ def request_video(session: requests.Session, video_id: AnyStr):
 
     filename = create_filename(template_params)
 
-    if not _cmdl_opts.skip_media:
+    if not _CMDL_OPTS.skip_media:
         continue_code = download_video_media(session, filename, template_params)
-        if _cmdl_opts.break_on_existing and not continue_code:
+        if _CMDL_OPTS.break_on_existing and not continue_code:
             raise ExistingDownloadEncounteredQuit("Exiting as an existing video was encountered")
-        if _cmdl_opts.add_metadata:
+        if _CMDL_OPTS.add_metadata:
             add_metadata_to_container(filename, template_params)
-    if _cmdl_opts.dump_metadata:
+    if _CMDL_OPTS.dump_metadata:
         dump_metadata(filename, template_params)
-    if _cmdl_opts.download_thumbnail:
+    if _CMDL_OPTS.download_thumbnail:
         download_thumbnail(session, filename, template_params)
-    if _cmdl_opts.download_comments:
+    if _CMDL_OPTS.download_comments:
         download_comments(session, filename, template_params)
 
 
 def request_user(session: requests.Session, user_id: AnyStr):
     """Request videos associated with a user."""
 
-    output("Requesting videos from user {0}...\n".format(user_id), logging.INFO)
+    is_authed_user = True if user_id == "me" else False
+    if not is_authed_user:
+        output("Requesting videos from user {0}...\n".format(user_id), logging.INFO)
+    else:
+        output("Requesting videos from logged in user...\n", logging.INFO)
 
     video_ids = []
 
@@ -1103,10 +1109,10 @@ def request_user(session: requests.Session, user_id: AnyStr):
         videos_request.raise_for_status()
         user_videos_json = json.loads(videos_request.text)
         for video in user_videos_json["data"]["items"]:
-            video_ids.append(video["id"])
+            video_ids.append(video["essential"]["id"])
 
-    if _cmdl_opts.playlist_start:
-        start_index = _cmdl_opts.playlist_start
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
         if start_index >= len(video_ids):
             raise ArgumentException("Starting index exceeds length of the user's video playlist")
         else:
@@ -1123,18 +1129,19 @@ def request_user(session: requests.Session, user_id: AnyStr):
             continue
 
 
-def request_mylist(session: requests.Session, mylist_id: AnyStr):
+def request_mylist(session: requests.Session, mylist_id: AnyStr, is_authed_user: bool = False):
     """Request videos associated with a mylist."""
 
     output("Requesting mylist {0}...\n".format(mylist_id), logging.INFO)
-    session.options(MYLIST_API.format(mylist_id), headers=API_HEADERS) # OPTIONS
-    mylist_request = session.get(MYLIST_API.format(mylist_id), headers=API_HEADERS)
+    active_mylist_api = MYLIST_ME_API if is_authed_user else MYLIST_API
+    session.options(active_mylist_api.format(mylist_id), headers=API_HEADERS) # OPTIONS
+    mylist_request = session.get(active_mylist_api.format(mylist_id), headers=API_HEADERS)
     mylist_request.raise_for_status()
     mylist_json = json.loads(mylist_request.text)
     items = mylist_json["data"]["mylist"]["items"]
 
-    if _cmdl_opts.playlist_start:
-        start_index = _cmdl_opts.playlist_start
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
         if start_index >= len(items):
             raise ArgumentException("Starting index exceeds length of the mylist")
         else:
@@ -1154,16 +1161,22 @@ def request_mylist(session: requests.Session, mylist_id: AnyStr):
 def request_user_mylists(session: requests.Session, user_id: AnyStr):
     """Request mylists associated with a user."""
 
-    output("Requesting mylists from user {0}...\n".format(user_id), logging.INFO)
+    is_authed_user = True if user_id == "me" else False
+    if not is_authed_user:
+        output("Requesting mylists from user {0}...\n".format(user_id), logging.INFO)
+    else:
+        output("Requesting mylists from logged in user...\n", logging.INFO)
 
     mylists_request = session.get(USER_MYLISTS_API.format(user_id), headers=API_HEADERS)
     mylists_request.raise_for_status()
     user_mylists_json = json.loads(mylists_request.text)
     user_mylists = user_mylists_json["data"]["mylists"]
+    total_mylists = len(user_mylists)
+    output("{} mylists returned.\n".format(total_mylists), logging.INFO)
     for index, item in enumerate(user_mylists):
         try:
             output("{0}/{1}\n".format(index + 1, len(user_mylists)), logging.INFO)
-            request_mylist(session, item["id"])
+            request_mylist(session, item["id"], is_authed_user)
 
         except (FormatNotSupportedException, FormatNotAvailableException, ParameterExtractionException) as error:
             log_exception(error)
@@ -1174,42 +1187,79 @@ def request_series(session: requests.Session, series_id: AnyStr):
     "Request videos associated with a series."
 
     output("Requesting series {0}...\n".format(series_id), logging.INFO)
-    series_request = session.get(SERIES_URL.format(series_id))
+    session.options(SERIES_API.format(series_id), headers=API_HEADERS) # OPTIONS
+    series_request = session.get(SERIES_API.format(series_id), headers=API_HEADERS)
     series_request.raise_for_status()
-    series_page = BeautifulSoup(series_request.text, "html.parser")
+    mylist_json = json.loads(series_request.text)
+    items = mylist_json["data"]["items"]
 
-    series_videos = series_page.select("div.SeriesVideoListContainer div.NC-MediaObject-main a")
+    if _CMDL_OPTS.playlist_start:
+        start_index = _CMDL_OPTS.playlist_start
+        if start_index >= len(items):
+            raise ArgumentException("Starting index exceeds length of the series")
+        else:
+            items = items[start_index:]
+            output("Beginning at index {}.\n".format(start_index), logging.INFO)
 
-    if len(series_videos) == 0:
-        output("No videos identified for series.\n", logging.INFO)
-        return
-
-    video_ids = []
-    for link in series_videos:
-        unstripped_id = link["href"]
-        video_ids.append(re.sub(r"^https://www.nicovideo.jp/watch/", "", unstripped_id))
-
-    for index, video_id in enumerate(video_ids):
+    for index, item in enumerate(items):
         try:
-            output("{0}/{1}\n".format(index + 1, len(video_ids)), logging.INFO)
-            request_video(session, video_id)
+            output("{0}/{1}\n".format(index + 1, len(items)), logging.INFO)
+            request_video(session, item["video"]["id"])
 
         except (FormatNotSupportedException, FormatNotAvailableException, ParameterExtractionException) as error:
             log_exception(error)
             continue
 
 
+def request_user_series(session: requests.Session, user_id: AnyStr):
+    """Request series associated with a user."""
+
+    output("Requesting series from user {0}...\n".format(user_id), logging.INFO)
+
+    series_request = session.get(USER_SERIES_API.format(user_id), headers=API_HEADERS)
+    series_request.raise_for_status()
+    user_series_json = json.loads(series_request.text)
+    user_series = user_series_json["data"]["items"]
+    for index, item in enumerate(user_series):
+        try:
+            output("{0}/{1}\n".format(index + 1, len(user_series)), logging.INFO)
+            request_series(session, item["id"])
+
+        except (FormatNotSupportedException, FormatNotAvailableException, ParameterExtractionException) as error:
+            log_exception(error)
+            continue
+
+
+def request_user_following(session: requests.Session, user_id: AnyStr):
+    """Request following users associated with a user and output as a list of URLs."""
+
+    is_authed_user = True if user_id == "me" else False
+    if not is_authed_user:
+        output("Requesting following users from user {0}...\n".format(user_id), logging.INFO)
+    else:
+        output("Requesting following users from logged in user...\n", logging.INFO)
+
+    following_request = session.get(USER_FOLLOWING_API.format(user_id), headers=API_HEADERS)
+    following_request.raise_for_status()
+    following_json = json.loads(following_request.text)
+    following = following_json["data"]["items"]
+
+    for item in following:
+        user_url = USER_URL.format(item["id"])
+        output(f"{user_url}\n", logging.INFO, force=True)
+
+
 def show_multithread_progress(video_len):
     """Track overall download progress across threads."""
 
-    global _progress, _start_time
+    global _PROGRESS, _START_TIME
     finished = False
     while not finished:
-        if _progress >= video_len:
+        if _PROGRESS >= video_len:
             finished = True
-        done = int(25 * _progress / video_len)
-        percent = int(100 * _progress / video_len)
-        speed_str = calculate_speed(_start_time, time.time(), _progress)
+        done = int(25 * _PROGRESS / video_len)
+        percent = int(100 * _PROGRESS / video_len)
+        speed_str = calculate_speed(_START_TIME, time.time(), _PROGRESS)
         output("\r|{0}{1}| {2}/100 @ {3:9}/s".format("#" * done, " " * (25 - done), percent, speed_str), logging.DEBUG)
 
 
@@ -1219,8 +1269,8 @@ def update_multithread_progress(bytes_len):
     lock = threading.Lock()
     lock.acquire()
     try:
-        global _progress
-        _progress += bytes_len
+        global _PROGRESS
+        _PROGRESS += bytes_len
     finally:
         lock.release()
 
@@ -1245,26 +1295,54 @@ def download_video_part(session: requests.Session, start, end, filename: AnyStr,
             update_multithread_progress(len(block))
 
 
-def perform_ffmpeg_dl(video_id: AnyStr, filename: AnyStr, duration: float, streams: List):
-    """Send video and/or audio stream to ffmpeg for download."""
+def perform_native_hls_dl(session: requests.Session, filename: AnyStr, duration: float, m3u8_streams: List, threads: int = 1):
+    """Download video and audio streams using native HLS downloader and merge using ffmpeg if necessary."""
 
-    try:
-        video_download = FfmpegDL(streams=streams,
-                                    input_kwargs={
-                                        "protocol_whitelist": "https,http,tls,tcp,file,crypto",
-                                        "allowed_extensions": "ALL",
-                                    },
-                                    output_path=filename,
-                                    output_kwargs={
-                                        "vcodec": "copy",
-                                        "acodec": "copy",
-                                    })
-        video_download.convert(name=video_id, duration=duration)
-        return True
-    except FfmpegDLException as error:
-        raise FormatNotAvailableException(f"ffmpeg failed to download the video or audio stream with the following error: \"{error}\"")
-    except Exception:
-        raise FormatNotAvailableException("Failed to download video or audio stream")
+    with get_temp_dir() as temp_dir:
+        with Progress() as progress:
+            tasks = []
+            for stream, name in m3u8_streams:
+                random_path_string = ''.join(random.choices(string.ascii_letters + string.digits, k=TEMP_PATH_LEN))
+                stream_filename = replace_extension(os.path.join(temp_dir, random_path_string), "ts")
+                thread = threading.Thread(target=download_hls, args=(stream, stream_filename, name, session, progress, threads))
+                thread.start()
+                tasks.append({
+                    "thread": thread,
+                    "filename": stream_filename,
+                })
+
+            for task in tasks:
+                task["thread"].join()
+
+        if not tasks:
+            raise ArgumentException("No HLS download tasks were received")
+
+        # Video and audio
+        if len(tasks) > 1:
+            stream_filenames = [task["filename"] for task in tasks]
+
+            try:
+                video_convert = FfmpegDL(streams=stream_filenames,
+                                        input_kwargs={},
+                                        output_path=filename,
+                                        output_kwargs={
+                                            "vcodec": "copy",
+                                            "acodec": "copy",
+                                        })
+                video_convert.convert(name='Merging audio and video', duration=duration)
+            except FfmpegExistsException as error:
+                raise(error)
+            except FfmpegDLException as error:
+                raise FormatNotAvailableException(f"ffmpeg failed to download the video or audio stream with the following error: \"{error}\"") from error
+            except Exception as exception:
+                raise FormatNotAvailableException("Failed to download video or audio stream") from exception
+
+            for stream_filename in stream_filenames:
+                os.remove(stream_filename)
+        # Only audio or video
+        else:
+            shutil.move(tasks[0]["filename"], filename)
+    return True
 
 
 def download_video_media(session: requests.Session, filename: AnyStr, template_params: dict):
@@ -1282,49 +1360,33 @@ def download_video_media(session: requests.Session, filename: AnyStr, template_p
 
     # Dwango Media Service (DMS)
     if template_params.get("dms_video_uri") or template_params.get("dms_audio_uri"):
-
         # .part file
         if os.path.exists(filename):
             output("Resuming partial downloads is not supported for videos using DMS delivery. Any partial video data will be overwritten.\n", logging.WARNING)
-        if _cmdl_opts.threads:
-            output("Multithreading is only supported for DMC delivery. Video will be downloaded using one thread.\n", logging.WARNING)
 
         m3u8_streams = []
-        with get_temp_dir() as temp_dir:
-            for stream_type in ["dms_video_uri", "dms_audio_uri"]:
-                if template_params.get(stream_type):
-                    m3u8_path = os.path.join(temp_dir, f"{template_params['id']}_{stream_type}.m3u8")
-                    m3u8 = generic_dl_request(session, template_params[stream_type], m3u8_path)
-                    # It's minimally viable to only rewrite the key file locally for now
-                    # Might be wise to eventually do this with the map and all individual segments
-                    key_match = M3U8_KEY_RE.search(m3u8)
-                    if not key_match:
-                        raise FormatNotAvailableException("Could not retrieve key file from manifest")
-                    key_url = key_match[2]
-                    key_path =  os.path.join(temp_dir, f"{template_params['id']}_{stream_type}.key")
-                    key_path = key_path.replace("\\", "/")
-                    generic_dl_request(session, key_url, key_path, binary=True)
-                    rewrite_file(m3u8_path, key_url, key_path)
-                    m3u8_streams.append(m3u8_path)
-            continue_code = perform_ffmpeg_dl(template_params["id"], filename, float(template_params["duration"]), m3u8_streams)
-            os.rename(filename, complete_filename)
-            return continue_code
+        for stream_type, name in [("dms_video_uri", "video"), ("dms_audio_uri", "audio")]:
+            if template_params.get(stream_type):
+                m3u8_streams.append((template_params[stream_type], name))
+        continue_code = perform_native_hls_dl(session, filename, float(template_params["duration"]), m3u8_streams, _CMDL_OPTS.threads)
+        os.rename(filename, complete_filename)
+        return continue_code
 
     # Dwango Media Cluster (DMC)
     dl_stream = session.head(template_params["url"])
     dl_stream.raise_for_status()
     video_len = int(dl_stream.headers["content-length"])
 
-    if _cmdl_opts.threads:
+    if _CMDL_OPTS.threads:
         output("Multithreading is experimental and will overwrite any existing files. --break-on-existing will be ignored.\n", logging.WARNING)
 
-        threads = int(_cmdl_opts.threads)
+        threads = int(_CMDL_OPTS.threads)
         if threads <= 0:
             raise ArgumentException("Thread number must be a positive integer")
 
         # Track total bytes downloaded across threads
-        global _progress
-        _progress = 0
+        global _PROGRESS
+        _PROGRESS = 0
 
         # Pad out file to full length
         file = open(filename, "wb")
@@ -1334,8 +1396,8 @@ def download_video_media(session: requests.Session, filename: AnyStr, template_p
         # Calculate ranges for threads and dispatch
         part = math.ceil(video_len / threads)
 
-        global _start_time
-        _start_time = time.time()
+        global _START_TIME
+        _START_TIME = time.time()
 
         for i in range(threads):
             start = part * i
@@ -1377,11 +1439,11 @@ def download_video_media(session: requests.Session, filename: AnyStr, template_p
                             "Current byte position exceeds the length of the video to be downloaded. Check the integrity of the existing file and "
                             "use --force-high-quality to resume this download when the high quality source is available.\n"
                         )
-                except MP4StreamInfoError:  # Thrown if not a valid MP4 (FLV, SWF)
+                except MP4StreamInfoError as error:  # Thrown if not a valid MP4 (FLV, SWF)
                     raise FormatNotAvailableException(
                         "Current byte position exceeds the length of the video to be downloaded. Check the integrity of the existing file and use "
                         "--force-high-quality to resume this download when the high quality source is available.\n"
-                    )
+                    ) from error
 
             # current_byte_pos == video_len
             else:
@@ -1425,13 +1487,13 @@ def download_video_media(session: requests.Session, filename: AnyStr, template_p
 
     with open(filename, file_condition) as file:
         file.seek(dl)
-        _start_time = time.time()
+        _START_TIME = time.time()
         for block in stream_iterator:
             dl += len(block)
             file.write(block)
             done = int(25 * dl / video_len)
             percent = int(100 * dl / video_len)
-            speed_str = calculate_speed(_start_time, time.time(), dl)
+            speed_str = calculate_speed(_START_TIME, time.time(), dl)
             output("\r|{0}{1}| {2}/100 @ {3:9}/s".format("#" * done, " " * (25 - done), percent, speed_str), logging.DEBUG)
         output("\n", logging.DEBUG)
 
@@ -1478,7 +1540,7 @@ def list_qualities(sources_type: str, sources: list, is_dms: bool):
 def select_quality(template_params: dict, template_key: AnyStr, sources: list, quality="") -> List[AnyStr]:
     """Select the specified quality from a sources list on DMC and DMS videos."""
 
-    if quality and _cmdl_opts.force_high_quality:
+    if quality and _CMDL_OPTS.force_high_quality:
         output("-f/--force-high-quality was set. Ignoring specified quality...\n", logging.WARNING)
 
     # Assumes qualities are in descending order
@@ -1488,9 +1550,9 @@ def select_quality(template_params: dict, template_key: AnyStr, sources: list, q
     lq_available = lowest_quality["isAvailable"]
 
     # quality = "highest"
-    if not hq_available and (_cmdl_opts.force_high_quality or (quality and quality.lower() == "highest")):
+    if not hq_available and (_CMDL_OPTS.force_high_quality or (quality and quality.lower() == "highest")):
         raise FormatNotAvailableException("Highest quality is not currently available")
-    elif _cmdl_opts.force_high_quality or (quality and quality.lower() == "highest"):
+    elif _CMDL_OPTS.force_high_quality or (quality and quality.lower() == "highest"):
         template_params[template_key] = highest_quality["id"]
         return [template_params[template_key]]
 
@@ -1514,9 +1576,8 @@ def select_quality(template_params: dict, template_key: AnyStr, sources: list, q
 
     # Default (return all qualities)
     else:
-        default_quality = bare_sources[0]
-        template_params[template_key] = default_quality
-        return [default_quality]
+        template_params[template_key] = bare_sources
+        return bare_sources
 
 
 def perform_api_request(session: requests.Session, document: BeautifulSoup) -> dict:
@@ -1526,25 +1587,25 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
 
     # .mp4 videos (HTML5)
     # As of 2021, all videos are served this way
-    if document.find(id="js-initial-watch-data"):
-        params = json.loads(document.find(id="js-initial-watch-data")["data-api-data"])
+    if document.find("meta", {"name": "server-response"}):
+        params = json.loads(document.find("meta", {"name": "server-response"})["content"])["data"]["response"]
 
         if params["video"]["isDeleted"]:
             raise FormatNotAvailableException("Video was deleted")
 
         template_params = collect_video_parameters(session, template_params, params)
 
-        if (_cmdl_opts.no_audio and _cmdl_opts.no_video):
+        if (_CMDL_OPTS.no_audio and _CMDL_OPTS.no_video):
             output("--no-audio and --no-video were both specified. Treating this download as if --skip-media was set.\n", logging.WARNING)
-            _cmdl_opts.skip_media = True
-        if _cmdl_opts.skip_media and not _cmdl_opts.list_qualities:
+            _CMDL_OPTS.skip_media = True
+        if _CMDL_OPTS.skip_media and not _CMDL_OPTS.list_qualities:
             return template_params
 
         # Perform request to Dwango Media Service (DMS)
         # Began rollout starting 2023-11-01 for select videos and users (https://blog.nicovideo.jp/niconews/205042.html)
         # Videos longer than 30 minutes in HD (>720p) quality appear to be served this way exclusively
         elif params["media"]["domand"]:
-            if _cmdl_opts.list_qualities:
+            if _CMDL_OPTS.list_qualities:
                 list_qualities("video", params["media"]["domand"]["videos"], True)
                 list_qualities("audio", params["media"]["domand"]["audios"], True)
                 raise ListQualitiesQuit("Exiting after listing available qualities")
@@ -1557,13 +1618,13 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
                 template_params,
                 "video_quality",
                 params["media"]["domand"]["videos"],
-                _cmdl_opts.video_quality or "highest"
+                _CMDL_OPTS.video_quality
             )
             audio_sources = select_quality(
                 template_params,
                 "audio_quality",
                 params["media"]["domand"]["audios"],
-                _cmdl_opts.audio_quality or "highest"
+                _CMDL_OPTS.audio_quality
             )
 
             # Limited to one video and audio source
@@ -1574,7 +1635,7 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
             output("Retrieving video manifest...\n", logging.INFO)
             headers = {
                 "X-Access-Right-Key": access_right_key,
-                "X-Request-With": "https://www.nicovideo.jp", # Only provided on this endpoint
+                "X-Request-With": "nicovideo", # Only provided on this endpoint
             }
             session.options(VIDEO_DMS_WATCH_API.format(video_id, watch_track_id)) # OPTIONS
             get_manifest_request = session.post(VIDEO_DMS_WATCH_API.format(video_id, watch_track_id), headers={**API_HEADERS, **headers}, data=payload)
@@ -1586,9 +1647,9 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
             output("Retrieved video manifest.\n", logging.INFO)
 
             output("Collecting video media URIs...\n")
-            if not _cmdl_opts.no_video:
+            if not _CMDL_OPTS.no_video:
                 template_params["dms_video_uri"] = get_stream_from_manifest(manifest_text)
-            if not _cmdl_opts.no_audio:
+            if not _CMDL_OPTS.no_audio:
                 template_params["dms_audio_uri"] = get_media_from_manifest(manifest_text, "audio")
 
             # Modify container when only one stream is specified
@@ -1601,9 +1662,7 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
 
         # Perform request to Dwango Media Cluster (DMC)
         elif params["media"]["delivery"]:
-            output("Higher available qualities may not be available to download for certain videos uploaded after 2023-11-01. Follow this issue for more detail: https://github.com/AlexAplin/nndownload/issues/139\n", logging.INFO)
-
-            if _cmdl_opts.list_qualities:
+            if _CMDL_OPTS.list_qualities:
                 list_qualities("video", params["media"]["delivery"]["movie"]["videos"], False)
                 list_qualities("audio", params["media"]["delivery"]["movie"]["audios"], False)
                 raise ListQualitiesQuit("Exiting after listing available qualities")
@@ -1620,13 +1679,13 @@ def perform_api_request(session: requests.Session, document: BeautifulSoup) -> d
                 template_params,
                 "video_quality",
                 params["media"]["delivery"]["movie"]["videos"],
-                _cmdl_opts.video_quality
+                _CMDL_OPTS.video_quality
             )
             audio_sources = select_quality(
                 template_params,
                 "audio_quality",
                 params["media"]["delivery"]["movie"]["audios"],
-                _cmdl_opts.audio_quality
+                _CMDL_OPTS.audio_quality
             )
 
             heartbeat_lifetime = params["media"]["delivery"]["movie"]["session"]["heartbeatLifetime"]
@@ -1825,17 +1884,21 @@ def dump_metadata(filename: AnyStr, template_params: dict):
     filename = replace_extension(filename, "json")
 
     with open(filename, "w", encoding="utf-8") as file:
-        json.dump(template_params, file, sort_keys=True)
+        json.dump(template_params, file, indent=4, ensure_ascii=False, sort_keys=True)
 
     output("Finished downloading metadata for {0}.\n".format(template_params["id"]), logging.INFO)
 
 
-def download_thumbnail(session: requests.Session, filename: AnyStr, template_params: dict):
-    """Download the video thumbnail."""
+def download_thumbnail(session: requests.Session, filename: AnyStr, template_params: dict, set_thumb_extension: bool = False):
+    """Download the media thumbnail."""
 
     output("Downloading thumbnail for {0}...\n".format(template_params["id"]), logging.INFO)
 
-    filename = replace_extension(filename, "jpg")
+    # TODO: Probably should check for mimetype
+    if set_thumb_extension:
+        filename = replace_extension(filename, "thumb.jpg")
+    else:
+        filename = replace_extension(filename, "jpg")
 
     thumb_request = session.get(template_params["thumbnail_url"])
     thumb_request.raise_for_status()
@@ -1858,8 +1921,8 @@ def download_comments(session: requests.Session, filename: AnyStr, template_para
     session.options(COMMENTS_API, headers=API_HEADERS) # OPTIONS
     get_comments_request = session.post(COMMENTS_API, data=comments_post, headers=API_HEADERS)
     get_comments_request.raise_for_status()
-    with open(filename, "wb") as file:
-        file.write(get_comments_request.content)
+    with open(filename, "w", encoding="utf-8") as file:
+        json.dump(get_comments_request.json(), file, indent=4, ensure_ascii=False, sort_keys=True)
 
     output("Finished downloading comments for {0}.\n".format(template_params["id"]), logging.INFO)
 
@@ -1900,14 +1963,14 @@ def login(username: str, password: str, session_cookie: str) -> requests.Session
 
     session.headers.update({"User-Agent": f"{MODULE_NAME}/{__version__}"})
 
-    if _cmdl_opts.proxy:
+    if _CMDL_OPTS.proxy:
         proxies = {
-            "http": _cmdl_opts.proxy,
-            "https": _cmdl_opts.proxy
+            "http": _CMDL_OPTS.proxy,
+            "https": _CMDL_OPTS.proxy
         }
         session.proxies.update(proxies)
 
-    if not _cmdl_opts.no_login:
+    if not _CMDL_OPTS.no_login:
         if not session_cookie:
             output("Logging in...\n", logging.INFO)
 
@@ -1919,7 +1982,7 @@ def login(username: str, password: str, session_cookie: str) -> requests.Session
             login_request = session.post(LOGIN_URL, data=login_post)
             login_request.raise_for_status()
 
-            if ("message=cant_login" in login_request.url):
+            if "message=cant_login" in login_request.url:
                 raise AuthenticationException("Incorrect email/telephone or password. Please verify your login details")
 
             if ("mfa?continue" in login_request.url):
@@ -1979,19 +2042,33 @@ def process_url_mo(session, url_mo: Match):
     """Dispatches URL to the appropriate function."""
 
     url_id = url_mo.group(5)
+    if url_id == "my":
+        if _CMDL_OPTS.no_login:
+                raise AuthenticationException("Requesting a /my URL is not possible when -g/--no-login is specified. Please login or provide a session cookie")
+        url_id = "me" # Rewrite for use with the API
+
     if url_mo.group(8):
         output("Additional URL parameters will be ignored.\n", logging.WARNING)
     if url_mo.group(3) == "mylist":
         request_mylist(session, url_id)
     elif url_mo.group(2):
         request_nama(session, url_id)
-    elif url_mo.group(3) == "user":
+    elif url_mo.group(3) == "user" or url_id == "me":
+        is_authed_user = True if url_id == "me" else False
         if url_mo.group(6) == "mylist":
             if url_mo.group(7):
                 url_id = url_mo.group(7)
-                request_mylist(session, url_id)
+                request_mylist(session, url_id, is_authed_user)
             else:
                 request_user_mylists(session, url_id)
+        elif url_mo.group(6) == "series":
+            if url_mo.group(7):
+                url_id = url_mo.group(7)
+                request_series(session, url_id)
+            else:
+                request_user_series(session, url_id)
+        elif url_mo.group(6) == "follow":
+            request_user_following(session, url_id)
         elif not url_mo.group(6) or url_mo.group(6) == "video":
             request_user(session, url_id)
         else:
@@ -2013,6 +2090,15 @@ def process_url_mo(session, url_mo: Match):
             download_image(session, url_id)
         else:
             raise ArgumentException("Seiga URL argument is not of a known or accepted type of Nico URL")
+    elif url_mo.group(1) == "manga":
+        if url_mo.group(3) == "watch":
+            download_manga_chapter(session, url_id)
+        elif url_mo.group(3) == "comic":
+            download_manga(session, url_id)
+        elif url_mo.group(3) == "user/manga" or url_mo.group(3) == "manga":
+            if url_mo.group(8):
+                url_id = url_mo.group(8)
+            request_seiga_user_manga(session, url_id)
     elif url_mo.group(1) == "ch":
         if url_mo.group(3) == "article":
             download_channel_article(session, url_id)
@@ -2037,15 +2123,17 @@ def process_url_mo(session, url_mo: Match):
 
 
 def main():
+    """Main entry"""
+
     try:
         configure_logger()
 
-        account_username = _cmdl_opts.username
-        account_password = _cmdl_opts.password
-        session_cookie = _cmdl_opts.session_cookie
+        account_username = _CMDL_OPTS.username
+        account_password = _CMDL_OPTS.password
+        session_cookie = _CMDL_OPTS.session_cookie
 
-        if _cmdl_opts.netrc:
-            if _cmdl_opts.username or _cmdl_opts.password or _cmdl_opts.session_cookie:
+        if _CMDL_OPTS.netrc:
+            if _CMDL_OPTS.username or _CMDL_OPTS.password or _CMDL_OPTS.session_cookie:
                 output("Ignoring input credentials in favor of .netrc.\n", logging.WARNING)
 
             account_credentials = netrc.netrc().authenticators(HOST)
@@ -2054,7 +2142,7 @@ def main():
                 account_password = account_credentials[2]
             else:
                 raise netrc.NetrcParseError("No authenticator available for {0}".format(HOST))
-        elif not _cmdl_opts.no_login:
+        elif not _CMDL_OPTS.no_login:
             while not account_username and not account_password and not session_cookie:
                 account_username = input("Email/telephone: ")
                 if account_username and not account_password:
@@ -2068,7 +2156,7 @@ def main():
 
         session = login(account_username, account_password, session_cookie)
 
-        for arg_item in _cmdl_opts.input:
+        for arg_item in _CMDL_OPTS.input:
             try:
                 # Test if input is a valid URL or file
                 url_mo = VALID_URL_RE.match(arg_item)
@@ -2083,7 +2171,7 @@ def main():
                 process_url_mo(session, url_mo)
 
             except Exception as error:
-                if len(_cmdl_opts.input) == 1:
+                if len(_CMDL_OPTS.input) == 1:
                     raise
                 else:
                     log_exception(error)
@@ -2093,16 +2181,19 @@ def main():
         output(f"{inert_exception}\n", logging.INFO)
     except Exception as error:
         log_exception(error)
+        raise
 
 
 def cli():
-    global _cmdl_opts
+    """CLI entry"""
+
+    global _CMDL_OPTS
 
     try:
-        _cmdl_opts = cmdl_parser.parse_args()
+        _CMDL_OPTS = cmdl_parser.parse_args()
         main()
     except KeyboardInterrupt:
-        output(f"Keyboard interrupt received. Exiting...\n", logging.INFO)
+        output("Keyboard interrupt received. Exiting...\n", logging.INFO)
         sys.exit(1)
 
 
